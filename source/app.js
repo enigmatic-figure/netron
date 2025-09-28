@@ -412,6 +412,12 @@ app.Application = class {
                     accelerator: 'CmdOrCtrl+Shift+E',
                     click: async () => await this.execute('export', null)
                 },
+                {
+                    id: 'file.export-modified',
+                    label: 'Export Modified &Model...',
+                    accelerator: 'CmdOrCtrl+Alt+M',
+                    click: async () => await this.execute('export-modified', null)
+                },
                 { type: 'separator' },
                 { role: 'close' },
             ];
@@ -436,6 +442,19 @@ app.Application = class {
             menuTemplate.push({
                 label: '&Edit',
                 submenu: [
+                    {
+                        id: 'edit.undo',
+                        label: '&Undo Change',
+                        accelerator: 'CmdOrCtrl+Z',
+                        click: async () => await this.execute('undo', null),
+                    },
+                    {
+                        id: 'edit.redo',
+                        label: '&Redo Change',
+                        accelerator: 'CmdOrCtrl+Shift+Z',
+                        click: async () => await this.execute('redo', null),
+                    },
+                    { type: 'separator' },
                     {
                         id: 'edit.cut',
                         label: 'Cu&t',
@@ -574,6 +593,15 @@ app.Application = class {
             const commandTable = new Map();
             commandTable.set('file.export', {
                 enabled: (view) => view && view.path ? true : false
+            });
+            commandTable.set('file.export-modified', {
+                enabled: (view) => view && view.get('export-modified.enabled') ? true : false
+            });
+            commandTable.set('edit.undo', {
+                enabled: (view) => view && view.get('undo.enabled') ? true : false
+            });
+            commandTable.set('edit.redo', {
+                enabled: (view) => view && view.get('redo.enabled') ? true : false
             });
             commandTable.set('edit.cut', {
                 enabled: (view) => view && view.path ? true : false
