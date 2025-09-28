@@ -193,6 +193,15 @@ desktop.Host = class {
         electron.ipcRenderer.on('export', (sender, data) => {
             this._view.export(data.file);
         });
+        electron.ipcRenderer.on('export-modified', () => {
+            this._view.exportModifiedModel();
+        });
+        electron.ipcRenderer.on('undo', () => {
+            this._view.undo();
+        });
+        electron.ipcRenderer.on('redo', () => {
+            this._view.redo();
+        });
         electron.ipcRenderer.on('cut', () => {
             this.document.execCommand('cut');
         });

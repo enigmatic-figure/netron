@@ -27,6 +27,14 @@ view.View = class {
         this._modelFactoryService = new view.ModelFactoryService(this._host);
         this._modelFactoryService.import();
         this._worker = this._host.environment('measure') ? null : new view.Worker(this._host);
+        this._editManager = new view.EditManager(this);
+        this._editManager.on('change', () => {
+            this._refreshEditState();
+        });
+        this._editManager.on('reset', () => {
+            this._refreshEditState();
+        });
+        this._refreshEditState();
     }
 
     async start() {
@@ -100,6 +108,12 @@ view.View = class {
                         enabled: () => this.activeTarget
                     });
                     file.add({
+                        label: 'Export Modified &Model...',
+                        accelerator: 'CmdOrCtrl+Alt+M',
+                        execute: async () => await this.exportModifiedModel(),
+                        enabled: () => this._editManager.hasChanges()
+                    });
+                    file.add({
                         label: platform === 'darwin' ? '&Close Window' : '&Close',
                         accelerator: 'CmdOrCtrl+W',
                         execute: async () => await this._host.execute('close'),
@@ -122,8 +136,27 @@ view.View = class {
                         execute: async () => await this.export(`${this._host.document.title}.svg`),
                         enabled: () => this.activeTarget
                     });
+                    file.add({
+                        label: 'Export Modified &Model...',
+                        accelerator: 'CmdOrCtrl+Alt+M',
+                        execute: async () => await this.exportModifiedModel(),
+                        enabled: () => this._editManager.hasChanges()
+                    });
                 }
                 const edit = this._menu.group('&Edit');
+                edit.add({
+                    label: '&Undo Change',
+                    accelerator: 'CmdOrCtrl+Z',
+                    execute: () => this.undo(),
+                    enabled: () => this._editManager.canUndo()
+                });
+                edit.add({
+                    label: '&Redo Change',
+                    accelerator: 'CmdOrCtrl+Shift+Z',
+                    execute: () => this.redo(),
+                    enabled: () => this._editManager.canRedo()
+                });
+                edit.add({});
                 edit.add({
                     label: '&Find...',
                     accelerator: 'CmdOrCtrl+F',
@@ -293,6 +326,9 @@ view.View = class {
 
     set model(value) {
         this._model = value;
+        if (this._editManager) {
+            this._editManager.reset(value);
+        }
     }
 
     get options() {
@@ -742,6 +778,65 @@ view.View = class {
                     await this.error(error);
                 }
             }
+        }
+    }
+
+    async exportModifiedModel() {
+        if (!this._model) {
+            return;
+        }
+        if (!this._editManager.hasChanges()) {
+            await this._host.message('There are no modifications to export.', true, 'OK');
+            return;
+        }
+        try {
+            const defaultName = this._model && this._model.name ? this._model.name : this._host.document.title || 'model';
+            const sanitize = (name) => name.replace(/[\\/:*?"<>|]+/g, '_');
+            const file = await this._host.save('Modified Model', 'json', `${sanitize(defaultName)}-modified`);
+            if (!file) {
+                return;
+            }
+            const content = this._editManager.serialize(this._model, {
+                title: this._host.document.title
+            });
+            const blob = new Blob([content], { type: 'application/json' });
+            await this._host.export(file, blob);
+        } catch (error) {
+            this.exception(error, false);
+        }
+    }
+
+    undo() {
+        this.undoChange();
+    }
+
+    redo() {
+        this.redoChange();
+    }
+
+    undoChange() {
+        if (this._editManager.undo()) {
+            this._refreshEditState();
+        }
+    }
+
+    redoChange() {
+        if (this._editManager.redo()) {
+            this._refreshEditState();
+        }
+    }
+
+    get editManager() {
+        return this._editManager;
+    }
+
+    _refreshEditState() {
+        if (this._host && this._host.update) {
+            this._host.update({
+                'undo.enabled': this._editManager.canUndo(),
+                'redo.enabled': this._editManager.canRedo(),
+                'export-modified.enabled': this._editManager.hasChanges()
+            });
         }
     }
 
@@ -2724,6 +2819,275 @@ view.Control = class {
     }
 };
 
+view.EditManager = class {
+
+    constructor(view) {
+        this._view = view;
+        this._listeners = new Map();
+        this.reset(null);
+    }
+
+    reset(model) {
+        this._model = model;
+        this._cache = new Map();
+        this._history = [];
+        this._future = [];
+        this.emit('reset', { model });
+    }
+
+    on(event, callback) {
+        this._listeners.set(event, this._listeners.get(event) || []);
+        this._listeners.get(event).push(callback);
+        return () => this.off(event, callback);
+    }
+
+    off(event, callback) {
+        if (this._listeners.has(event)) {
+            const list = this._listeners.get(event).filter((item) => item !== callback);
+            if (list.length > 0) {
+                this._listeners.set(event, list);
+            } else {
+                this._listeners.delete(event);
+            }
+        }
+    }
+
+    emit(event, data) {
+        if (this._listeners.has(event)) {
+            for (const callback of this._listeners.get(event)) {
+                callback(this, data);
+            }
+        }
+    }
+
+    hasChanges() {
+        return this._cache.size > 0;
+    }
+
+    canUndo() {
+        return this._history.length > 0;
+    }
+
+    canRedo() {
+        return this._future.length > 0;
+    }
+
+    supports(target, property) {
+        const value = this.get(target, property, target ? target[property] : undefined);
+        return value === null || value === undefined || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint';
+    }
+
+    isModified(target, property) {
+        const entry = this._cache.get(target);
+        if (!entry) {
+            return false;
+        }
+        return entry.has(property);
+    }
+
+    get(target, property, fallback) {
+        if (!target) {
+            return fallback;
+        }
+        const entry = this._cache.get(target);
+        if (entry && entry.has(property)) {
+            return entry.get(property).value;
+        }
+        return fallback;
+    }
+
+    set(target, property, value) {
+        const change = this._prepareChange(target, property, value);
+        if (!change) {
+            return false;
+        }
+        this._apply(change, 'apply');
+        return true;
+    }
+
+    undo() {
+        const change = this._history.pop();
+        if (!change) {
+            return false;
+        }
+        this._apply(change, 'undo');
+        return true;
+    }
+
+    redo() {
+        const change = this._future.pop();
+        if (!change) {
+            return false;
+        }
+        this._apply(change, 'redo');
+        return true;
+    }
+
+    changes() {
+        const list = [];
+        for (const [target, properties] of this._cache.entries()) {
+            for (const [property, entry] of properties.entries()) {
+                list.push({ target, property, original: entry.original, value: entry.value });
+            }
+        }
+        return list;
+    }
+
+    serialize(model, metadata) {
+        const map = new Map();
+        const clone = this._clone(model, map);
+        for (const change of this.changes()) {
+            const target = map.get(change.target);
+            if (target) {
+                target[change.property] = this._clone(change.value, map);
+            }
+        }
+        const document = {
+            signature: 'netron:modified-model',
+            generated: new Date().toISOString(),
+            metadata: {
+                title: metadata && metadata.title ? metadata.title : null,
+                path: metadata && metadata.path ? metadata.path : null
+            },
+            changes: this.changes().map((change) => this._describe(change)),
+            model: clone
+        };
+        const replacer = (key, value) => {
+            if (typeof value === 'bigint') {
+                return value.toString();
+            }
+            if (value instanceof Map) {
+                return { __type__: 'Map', entries: Array.from(value.entries()) };
+            }
+            if (value instanceof Set) {
+                return { __type__: 'Set', values: Array.from(value.values()) };
+            }
+            if (ArrayBuffer.isView(value)) {
+                return Array.from(value);
+            }
+            if (value instanceof ArrayBuffer) {
+                return Array.from(new Uint8Array(value));
+            }
+            return value;
+        };
+        return JSON.stringify(document, replacer, 2);
+    }
+
+    _prepareChange(target, property, value) {
+        if (!target) {
+            return null;
+        }
+        const entry = this._cache.get(target);
+        const original = entry && entry.has(property) ? entry.get(property).original : target[property];
+        const current = entry && entry.has(property) ? entry.get(property).value : target[property];
+        if (this._equals(current, value)) {
+            return null;
+        }
+        return { target, property, original, previous: current, value };
+    }
+
+    _apply(change, mode) {
+        let entry = this._cache.get(change.target);
+        if (!entry) {
+            entry = new Map();
+            this._cache.set(change.target, entry);
+        }
+        if (mode === 'apply' || mode === 'redo') {
+            entry.set(change.property, { original: change.original, value: change.value });
+            if (mode === 'apply') {
+                this._history.push(change);
+                this._future = [];
+            } else {
+                this._history.push(change);
+            }
+        } else if (mode === 'undo') {
+            if (this._equals(change.previous, change.original)) {
+                entry.delete(change.property);
+                if (entry.size === 0) {
+                    this._cache.delete(change.target);
+                }
+            } else {
+                entry.set(change.property, { original: change.original, value: change.previous });
+            }
+            this._future.push(change);
+        }
+        const currentValue = this.get(change.target, change.property, change.target ? change.target[change.property] : undefined);
+        const previousValue = mode === 'undo' ? change.value : change.previous;
+        this.emit('change', { target: change.target, property: change.property, value: currentValue, previous: previousValue, action: mode });
+    }
+
+    _equals(a, b) {
+        if (Number.isNaN(a) && Number.isNaN(b)) {
+            return true;
+        }
+        return a === b;
+    }
+
+    _clone(value, map) {
+        if (value === null || value === undefined || typeof value !== 'object') {
+            return value;
+        }
+        if (map.has(value)) {
+            return map.get(value);
+        }
+        if (Array.isArray(value)) {
+            const array = [];
+            map.set(value, array);
+            for (const item of value) {
+                array.push(this._clone(item, map));
+            }
+            return array;
+        }
+        if (value instanceof Map) {
+            const result = new Map();
+            map.set(value, result);
+            for (const [key, val] of value.entries()) {
+                result.set(this._clone(key, map), this._clone(val, map));
+            }
+            return result;
+        }
+        if (value instanceof Set) {
+            const result = new Set();
+            map.set(value, result);
+            for (const item of value.values()) {
+                result.add(this._clone(item, map));
+            }
+            return result;
+        }
+        if (ArrayBuffer.isView(value)) {
+            const result = new value.constructor(value);
+            map.set(value, result);
+            return result;
+        }
+        if (value instanceof ArrayBuffer) {
+            const result = value.slice(0);
+            map.set(value, result);
+            return result;
+        }
+        const proto = Object.getPrototypeOf(value);
+        const result = Object.create(proto || Object.prototype);
+        map.set(value, result);
+        for (const key of Object.keys(value)) {
+            try {
+                result[key] = this._clone(value[key], map);
+            } catch {
+                // continue regardless of error
+            }
+        }
+        return result;
+    }
+
+    _describe(change) {
+        const target = change.target || {};
+        const description = target.identifier || target.name || (target.type && target.type.name) || target.constructor && target.constructor.name || 'object';
+        return {
+            target: description,
+            property: change.property,
+            value: change.value
+        };
+    }
+};
+
 view.Expander = class extends view.Control {
 
     constructor(context) {
@@ -3178,23 +3542,25 @@ view.PrimitiveView = class extends view.Expander {
         super(context);
         try {
             this._argument = argument;
+            this._manager = this._view.editManager;
             const type = argument.type === 'attribute' ? null : argument.type;
-            const value = argument.value;
+            this._type = type;
+            const currentValue = this._manager ? this._manager.get(argument, 'value', argument.value) : argument.value;
             if (type) {
                 this.enable();
             }
             switch (type) {
                 case 'graph': {
                     const line = this.createElement('div', 'sidebar-item-value-line-link');
-                    line.textContent = value.name || '\u00A0';
-                    line.addEventListener('click', () => this.emit('activate', value));
+                    line.textContent = argument.value.name || '\u00A0';
+                    line.addEventListener('click', () => this.emit('activate', argument.value));
                     this.add(line);
                     break;
                 }
                 case 'function': {
                     const line = this.createElement('div', 'sidebar-item-value-line-link');
-                    line.textContent = value.type.name;
-                    line.addEventListener('click', () => this.emit('activate', value));
+                    line.textContent = argument.value.type.name;
+                    line.addEventListener('click', () => this.emit('activate', argument.value));
                     this.add(line);
                     break;
                 }
@@ -3207,20 +3573,14 @@ view.PrimitiveView = class extends view.Expander {
                     break;
                 }
                 default: {
-                    const formatter = new view.Formatter(value, type);
-                    let content = formatter.toString();
-                    if (content && content.length > 1000) {
-                        content = `${content.substring(0, 1000)}\u2026`;
+                    this._renderPrimitive(currentValue, type);
+                    if (this._manager && this._isEditable()) {
+                        this._manager.on('change', (sender, change) => {
+                            if (change.target === this._argument && change.property === 'value') {
+                                this._updateDisplay(change.value);
+                            }
+                        });
                     }
-                    if (content && typeof content === 'string') {
-                        content = content.split('<').join('&lt;').split('>').join('&gt;');
-                    }
-                    if (content.indexOf('\n') >= 0) {
-                        content = content.split('\n').join('<br>');
-                    }
-                    const line = this.createElement('div', 'sidebar-item-value-line');
-                    line.innerHTML = content ? content : '&nbsp;';
-                    this.add(line);
                 }
             }
         } catch (error) {
@@ -3259,6 +3619,116 @@ view.PrimitiveView = class extends view.Expander {
         child.className = this._first === false ? 'sidebar-item-value-line-border' : 'sidebar-item-value-line';
         this.add(child);
         this._first = false;
+    }
+
+    _renderPrimitive(value, type) {
+        const line = this.createElement('div');
+        const content = this.createElement('span', 'sidebar-item-value-line-content');
+        content.innerHTML = this._formatValue(value, type);
+        line.appendChild(content);
+        if (this._isEditable()) {
+            const button = this.createElement('div', 'sidebar-item-value-button');
+            button.classList.add('sidebar-item-value-button-tool');
+            button.setAttribute('title', 'Edit Value');
+            button.textContent = '\u270E';
+            button.addEventListener('click', async () => await this._promptEdit());
+            line.appendChild(button);
+        }
+        this._textElement = content;
+        this._lineElement = line;
+        this._add(line);
+        this._updateDisplay(value);
+    }
+
+    _formatValue(value, type) {
+        const formatter = new view.Formatter(value, type);
+        let content = formatter.toString();
+        if (content && typeof content === 'string') {
+            if (content.length > 1000) {
+                content = `${content.substring(0, 1000)}\u2026`;
+            }
+            content = content.split('<').join('&lt;').split('>').join('&gt;');
+            if (content.indexOf('\n') >= 0) {
+                content = content.split('\n').join('<br>');
+            }
+        }
+        return content ? content : '&nbsp;';
+    }
+
+    _isEditable() {
+        return this._manager && this._manager.supports(this._argument, 'value');
+    }
+
+    _updateDisplay(value) {
+        if (this._textElement) {
+            this._textElement.innerHTML = this._formatValue(value, this._type);
+        }
+        if (this._lineElement) {
+            if (this._manager && this._manager.isModified(this._argument, 'value')) {
+                this._lineElement.classList.add('sidebar-item-value-line-edited');
+            } else {
+                this._lineElement.classList.remove('sidebar-item-value-line-edited');
+            }
+        }
+    }
+
+    async _promptEdit() {
+        const current = this._manager ? this._manager.get(this._argument, 'value', this._argument.value) : this._argument.value;
+        const reference = current === undefined ? this._argument.value : current;
+        const defaultText = reference === null || reference === undefined ? '' : String(reference);
+        const input = this._host.window.prompt('Edit value', defaultText);
+        if (input === null) {
+            return;
+        }
+        try {
+            const value = this._parseInput(input, reference);
+            if (this._manager.set(this._argument, 'value', value)) {
+                this._updateDisplay(value);
+            }
+        } catch (error) {
+            await this._host.message(error.message, true, 'OK');
+        }
+    }
+
+    _parseInput(text, reference) {
+        const trimmed = text.trim();
+        if (reference === null || reference === undefined) {
+            if (trimmed.toLowerCase() === 'null') {
+                return null;
+            }
+            return text;
+        }
+        const type = typeof reference;
+        switch (type) {
+            case 'number': {
+                if (trimmed.length === 0) {
+                    throw new Error('Value cannot be empty.');
+                }
+                const value = Number(trimmed);
+                if (Number.isNaN(value)) {
+                    throw new Error('Value must be a number.');
+                }
+                return value;
+            }
+            case 'bigint': {
+                if (!/^[-+]?\d+$/.test(trimmed)) {
+                    throw new Error('Value must be an integer.');
+                }
+                return BigInt(trimmed);
+            }
+            case 'boolean': {
+                if (/^(true|1)$/i.test(trimmed)) {
+                    return true;
+                }
+                if (/^(false|0)$/i.test(trimmed)) {
+                    return false;
+                }
+                throw new Error('Value must be true or false.');
+            }
+            default: {
+                return text;
+            }
+        }
     }
 };
 
